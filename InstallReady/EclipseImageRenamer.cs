@@ -118,7 +118,7 @@ namespace VMS.TPS
                         // the same ID if that is already the best valid result.
                         AdjustCount(usedIds, currentId, -1);
 
-                        string baseName = BuildBaseName(modality, seriesDescription);
+                        string baseName = BuildBaseName(modality, seriesDescription, suffix);
                         string proposedId = BuildUniqueId(baseName, suffix, usedIds);
 
                         // Reserve the proposal immediately so later preview rows see it
@@ -188,13 +188,13 @@ namespace VMS.TPS
             }
         }
 
-        private static string BuildBaseName(string modality, string rawDescription)
+        private static string BuildBaseName(string modality, string rawDescription, string bodySuffix)
         {
             string description = SafeTrim(rawDescription);
 
             // Scanner descriptions often include slice-thickness tokens that are useful
             // in acquisition metadata but noisy inside a 16-character ARIA ID.
-            description = Regex.Replace(description, "_\\d+\\.?\\d*mm", string.Empty, RegexOptions.IgnoreCase);
+            description = Regex.Replace(description, "(^|[_\\- ])\\d+(?:\\.\\d+)?mm\\b", "$1", RegexOptions.IgnoreCase);
             description = CollapseSeparators(description);
 
             if (StartsWithIgnoreCase(description, "ep2d"))
@@ -218,13 +218,129 @@ namespace VMS.TPS
             {
                 // Only add our CT_ prefix when the scanner description has not already
                 // started with CT_ or CT .
-                if (!Regex.IsMatch(description, "^CT([_ ])", RegexOptions.IgnoreCase))
+                if (!Regex.IsMatch(description, "^CT([_\\- ]|$)", RegexOptions.IgnoreCase))
                 {
-                    description = "CT_" + description;
+                    Match embeddedCt = Regex.Match(description, "^(.*?)\\bCT\\b[_\\- ]*(.*)$", RegexOptions.IgnoreCase);
+                    if (embeddedCt.Success)
+                    {
+                        string beforeCt = SafeTrim(embeddedCt.Groups[1].Value);
+                        string afterCt = SafeTrim(embeddedCt.Groups[2].Value);
+
+                        if (!string.IsNullOrEmpty(beforeCt) && !string.IsNullOrEmpty(afterCt))
+                        {
+                            description = "CT_" + beforeCt + "_" + afterCt;
+                        }
+                        else if (!string.IsNullOrEmpty(beforeCt))
+                        {
+                            description = "CT_" + beforeCt;
+                        }
+                        else
+                        {
+                            description = string.IsNullOrEmpty(afterCt) ? "CT" : "CT_" + afterCt;
+                        }
+                    }
+                    else
+                    {
+                        description = "CT_" + description;
+                    }
                 }
             }
 
+            description = RemoveRedundantBodySiteTerms(description, bodySuffix);
+            description = ApplyNamingAbbreviations(description);
+            description = EnsureModalityPrefix(modality, description);
+            description = CollapseSeparators(description);
+
+            if (string.IsNullOrEmpty(description))
+            {
+                description = modality;
+            }
+
             return description;
+        }
+
+        internal static string EnsureModalityPrefix(string modality, string description)
+        {
+            string safeModality = SafeToUpper(modality);
+            string cleaned = CollapseSeparators(description);
+
+            if (safeModality != "CT" && safeModality != "MR")
+            {
+                return cleaned;
+            }
+
+            if (safeModality == "MR")
+            {
+                cleaned = Regex.Replace(cleaned, "^MRI([_\\- ]|$)", "MR_", RegexOptions.IgnoreCase);
+            }
+
+            if (Regex.IsMatch(cleaned, "^" + safeModality + "([_\\- ]|$)", RegexOptions.IgnoreCase))
+            {
+                return cleaned;
+            }
+
+            return safeModality + "_" + cleaned;
+        }
+
+        private static string RemoveRedundantBodySiteTerms(string description, string bodySuffix)
+        {
+            string[] terms = GetBodySiteTerms(bodySuffix);
+            if (terms.Length == 0)
+            {
+                return description;
+            }
+
+            string cleaned = description;
+            foreach (string term in terms)
+            {
+                string pattern = "(^|[_\\- ])" + Regex.Escape(term).Replace("\\ ", "[_\\- ]+") + "(?=$|[_\\- ])";
+                cleaned = Regex.Replace(cleaned, pattern, "$1", RegexOptions.IgnoreCase);
+            }
+
+            return CollapseSeparators(cleaned);
+        }
+
+        private static string[] GetBodySiteTerms(string bodySuffix)
+        {
+            switch (SafeToUpper(bodySuffix))
+            {
+                case "_HN":
+                    return new string[] { "Head and Neck", "Head Neck", "H and N", "HN", "Head", "Neck", "Face", "Oral", "Oropharynx", "Nasopharynx", "Larynx", "Pharynx", "Parotid", "Mandible" };
+                case "_BR":
+                    return new string[] { "Brain", "Cranial", "Cranium", "Skull", "Intracranial", "Neuro" };
+                case "_CH":
+                    return new string[] { "Chest", "Thorax", "Thoracic", "Lung", "Lungs", "Mediastinum", "Mediastinal", "Breast", "Oesophagus", "Esophagus" };
+                case "_AB":
+                    return new string[] { "Abdomen", "Abdominal", "Liver", "Pancreas", "Kidney", "Kidneys", "Renal", "Adrenal", "Stomach", "Bowel", "Spleen" };
+                case "_PEL":
+                    return new string[] { "Pelvis", "Pelvic", "Prostate", "Bladder", "Rectum", "Rectal", "Uterus", "Uterine", "Ovary", "Ovarian", "Cervix", "Cervical", "Vulva", "Gynae", "Gyne", "Gynaecology", "Gynecology" };
+                case "_SP":
+                    return new string[] { "Spine", "Spinal", "Cervical Spine", "Thoracic Spine", "Lumbar Spine", "Cervical", "Thoracic", "Lumbar", "Sacrum", "Sacral", "Coccyx", "Vertebra", "Vertebral" };
+                case "_EXT":
+                    return new string[] { "Limb", "Limbs", "Extremity", "Extremities", "Leg", "Arm", "Knee", "Hip", "Shoulder", "Elbow", "Wrist", "Ankle", "Femur", "Femoral", "Tibia", "Tibial", "Foot", "Hand" };
+                default:
+                    return new string[0];
+            }
+        }
+
+        private static string ApplyNamingAbbreviations(string description)
+        {
+            string abbreviated = description;
+            abbreviated = Regex.Replace(abbreviated, "\\bPOST\\s+CONTRAST\\b", "POST", RegexOptions.IgnoreCase);
+            abbreviated = Regex.Replace(abbreviated, "\\bPOSTCONTRAST\\b", "POST", RegexOptions.IgnoreCase);
+            abbreviated = Regex.Replace(abbreviated, "\\bCONTRAST\\b", "POST", RegexOptions.IgnoreCase);
+            abbreviated = Regex.Replace(abbreviated, "\\bAXIAL\\b", "AX", RegexOptions.IgnoreCase);
+            abbreviated = Regex.Replace(abbreviated, "\\bSAGITTAL\\b", "SAG", RegexOptions.IgnoreCase);
+            abbreviated = Regex.Replace(abbreviated, "\\bCORONAL\\b", "COR", RegexOptions.IgnoreCase);
+            abbreviated = Regex.Replace(abbreviated, "\\bTRANSVERSE\\b", "TRA", RegexOptions.IgnoreCase);
+            abbreviated = Regex.Replace(abbreviated, "\\bDIFFUSION\\b", "DWI", RegexOptions.IgnoreCase);
+            abbreviated = Regex.Replace(abbreviated, "\\bDIFF\\b", "DWI", RegexOptions.IgnoreCase);
+            abbreviated = Regex.Replace(abbreviated, "\\bPLANNING\\b", "PLAN", RegexOptions.IgnoreCase);
+            abbreviated = Regex.Replace(abbreviated, "\\bSIMULATION\\b", "SIM", RegexOptions.IgnoreCase);
+            abbreviated = Regex.Replace(abbreviated, "\\bLOCALISER\\b", "LOC", RegexOptions.IgnoreCase);
+            abbreviated = Regex.Replace(abbreviated, "\\bLOCALIZER\\b", "LOC", RegexOptions.IgnoreCase);
+
+            return CollapseSeparators(abbreviated);
         }
 
         private static string ExtractEp2dMeaningfulToken(string description)
@@ -1134,6 +1250,15 @@ namespace VMS.TPS
             {
                 string edited = candidate.NewIdTextBox != null ? candidate.NewIdTextBox.Text : candidate.NewId;
                 string normalized = NormalizeEditedId(edited);
+
+                if (string.IsNullOrEmpty(normalized))
+                {
+                    errors.Add(SafeText(candidate.CurrentId) + " has a blank New ID.");
+                    rowErrors[candidate] = "New ID cannot be blank.";
+                    continue;
+                }
+
+                normalized = NormalizeEditedId(Script.EnsureModalityPrefix(candidate.Modality, normalized));
                 candidate.NewId = normalized;
 
                 if (candidate.NewIdTextBox != null && candidate.NewIdTextBox.Text != normalized)
@@ -1142,13 +1267,6 @@ namespace VMS.TPS
                     candidate.NewIdTextBox.Text = normalized;
                     candidate.NewIdTextBox.CaretIndex = candidate.NewIdTextBox.Text.Length;
                     _isNormalizingText = false;
-                }
-
-                if (string.IsNullOrEmpty(normalized))
-                {
-                    errors.Add(SafeText(candidate.CurrentId) + " has a blank New ID.");
-                    rowErrors[candidate] = "New ID cannot be blank.";
-                    continue;
                 }
 
                 if (IdsEqual(candidate.CurrentId, normalized))
